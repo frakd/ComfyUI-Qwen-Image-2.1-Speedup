@@ -43,20 +43,23 @@ already built into ComfyUI.
 
 ## Tuning
 
-Designed and calibrated for 40-step runs.
+Designed and calibrated for 40-step runs; the defaults are the measured
+sweet spot (adaptive `target_error` 0.05, first-order forecast, ~50% of
+forwards skipped at ~1.7x model speedup).
 
-- **Adaptive mode (recommended)**: `target_error` 0.05 is strict, 0.06-0.08
-  trades a little fidelity for clearly more speed. `cache_threshold` is the
-  starting point in this mode.
-- **Fixed mode** (`target_error = 0`): `cache_threshold` defaults to 0.40.
-  Measured drift is ~0.13 per step at 40 steps, so the threshold is roughly
-  0.13 x the skip run length: 0.3 skips ~2 steps per refresh, 0.5 ~3-4,
-  0.8 ~6.
+- **Adaptive mode (default, `target_error = 0.05`)**: after every skip run
+  the replay error is measured against the next real forward and the
+  effective threshold adjusted (0.7x-1.3x per correction). 0.06-0.08 is
+  faster with slightly lower fidelity. `cache_threshold` (0.30) is the
+  controller's starting point.
+- **Fixed mode** (`target_error = 0`): measured drift is ~0.13 per step at
+  40 steps, so the threshold is roughly 0.13 x the skip run length: 0.3
+  skips ~2 steps per refresh, 0.5 ~3-4, 0.8 ~6.
 - Keep `cache_start_percent` >= 0.15: measured replay error peaks right at
   the schedule start.
-- `forecast` `first` is the measured sweet spot. `second` tracks curvature
-  better on paper; compare both with `debug_log` on and watch the reported
-  replay-error mean/max.
+- `forecast` `first` is the measured sweet spot: at equal skip rate it cuts
+  the replay error roughly in half vs `off`. `second` showed no further gain
+  in testing and costs extra time; it stays available for comparison.
 - The node logs the skip rate at the end of each run; with `debug_log` (or
   adaptive mode) it also reports the measured replay error mean/max and the
   final effective threshold.

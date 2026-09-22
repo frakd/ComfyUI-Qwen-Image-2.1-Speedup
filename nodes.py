@@ -279,7 +279,6 @@ class QwenImage21Speedup(io.ComfyNode):
             node_id="QwenImage21Speedup",
             display_name="Qwen Image 2.1 Speedup",
             category="model/patch",
-            is_experimental=True,
             description="Sampling accelerator for Qwen Image 2.1: caches the whole-model residual and replays it on "
                         "low-drift steps (TeaCache-style) with sigma-space extrapolation (TaylorCache-style). "
                         "Compatible with the model's built-in prefix K/V cache.",
@@ -288,16 +287,16 @@ class QwenImage21Speedup(io.ComfyNode):
                 io.Boolean.Input("enable_cache", default=True,
                                  tooltip="Skip whole model forwards by replaying the cached residual while the "
                                          "accumulated timestep-embedding drift stays under the threshold."),
-                io.Float.Input("cache_threshold", default=0.40, min=0.0, max=2.0, step=0.01,
+                io.Float.Input("cache_threshold", default=0.30, min=0.0, max=2.0, step=0.01,
                                tooltip="Accumulated relative drift allowed before forcing a full forward. "
                                        "Measured drift on this model is ~0.13 per step at 40 steps, so the "
                                        "threshold is roughly 0.13 x the skip run length: 0.3 skips ~2 steps, "
-                                       "0.5 ~3-4, 0.8 ~6."),
-                io.Float.Input("target_error", default=0.0, min=0.0, max=1.0, step=0.005,
-                               tooltip="Adaptive mode: if > 0 (e.g. 0.05), the effective threshold is adjusted "
-                                       "after every measured replay error to hold the error near this target "
-                                       "(multiplicative feedback, 0.7x-1.3x per correction). Adapts to step "
-                                       "count, resolution and prompt automatically. 0 uses the fixed threshold."),
+                                       "0.5 ~3-4, 0.8 ~6. Starting point for the adaptive controller."),
+                io.Float.Input("target_error", default=0.05, min=0.0, max=1.0, step=0.005,
+                               tooltip="Adaptive mode: the effective threshold is adjusted after every measured "
+                                       "replay error to hold the error near this target (multiplicative "
+                                       "feedback, 0.7x-1.3x per correction). 0.06-0.08 is faster with slightly "
+                                       "lower fidelity. 0 uses the fixed cache_threshold."),
                 io.Float.Input("cache_start_percent", default=0.15, min=0.0, max=1.0, step=0.01,
                                tooltip="Caching only kicks in after this point in the sampling schedule. "
                                        "Measured replay error is highest right after the start, keep >= 0.15."),
