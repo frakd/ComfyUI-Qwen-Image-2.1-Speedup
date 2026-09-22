@@ -26,8 +26,12 @@ _MODEL_NAME = "QwenImage21Transformer2DModel"
 class _StreamState:
     def __init__(self):
         self.residual = None
+        self.residual_sigma = None
+        self.prev_residual = None
+        self.prev_residual_sigma = None
         self.prev_indicator = None
         self.last_sigma = None
+        self.last_used = None
         self.accumulated = 0.0
         self.consecutive_skips = 0
         self.full_steps = 0
@@ -35,23 +39,34 @@ class _StreamState:
         self.drift_sum = 0.0
         self.drift_max = 0.0
         self.drift_count = 0
+        self.pred_err_sum = 0.0
+        self.pred_err_max = 0.0
+        self.pred_err_count = 0
 
     def clear_tensors(self):
         self.residual = None
+        self.prev_residual = None
         self.prev_indicator = None
+        self.last_used = None
 
 
 class _TurboCache:
     """Caches the whole-forward residual (out - x) per conditioning stream and
     replays it while the accumulated drift of the timestep embedding stays
-    under the threshold."""
+    under the threshold. With forecast enabled, the replayed residual is a
+    linear extrapolation in sigma space from the last two measured residuals
+    (TaylorCache-style), which tracks the trajectory better than plain replay."""
 
-    def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device, debug=False):
+    _MAX_EXTRAPOLATE = 1.5
+
+    def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device,
+                 forecast=True, debug=False):
         self.threshold = threshold
         self.start_percent = start_percent
         self.end_percent = end_percent
         self.max_consecutive_skips = max_consecutive_skips
         self.cache_device = cache_device
+        self.forecast = forecast
         self.debug = debug
         self.streams = {}
 
@@ -73,6 +88,13 @@ class _TurboCache:
                 "QwenImage21Speedup: per-step indicator drift mean %.4f, max %.4f over %d steps "
                 "(a useful cache_threshold must exceed the mean; current %.3f)",
                 drift_sum / drift_count, drift_max, drift_count, self.threshold)
+        pred_err_count = sum(s.pred_err_count for s in self.streams.values())
+        if pred_err_count > 0 and self.debug:
+            err_sum = sum(s.pred_err_sum for s in self.streams.values())
+            err_max = max(s.pred_err_max for s in self.streams.values())
+            logging.info(
+                "QwenImage21Speedup: replayed-residual error vs actual forward mean %.4f, max %.4f over %d checks",
+                err_sum / pred_err_count, err_max, pred_err_count)
         for s in self.streams.values():
             s.clear_tensors()
         self.streams = {}
@@ -103,8 +125,8 @@ class _TurboCache:
         temb = model.time_text_embed(torch.cat([t, t.new_zeros(1)]), dtype)
         return temb[:-1].detach().float().flatten()
 
-    def _store_residual(self, state, residual):
-        # the residual outlives the forward, keep it out of the malloc graph
+    def _store_residual(self, state, residual, sigma):
+        # residuals outlive the forward, keep them out of the malloc graph
         with comfy.model_prefetch.pause_malloc_graph():
             residual = residual.detach()
             location = self.cache_device
@@ -114,12 +136,35 @@ class _TurboCache:
                 free = comfy.model_management.get_free_memory(residual.device)
                 location = "gpu" if free > 10 * residual.numel() * residual.element_size() + 256 * _MIB else "cpu"
             if location == "gpu":
-                state.residual = residual.clone()
+                stored = residual.clone()
             else:
-                pinned = torch.empty(residual.shape, dtype=residual.dtype, device="cpu",
+                stored = torch.empty(residual.shape, dtype=residual.dtype, device="cpu",
                                      pin_memory=torch.cuda.is_available())
-                pinned.copy_(residual, non_blocking=False)
-                state.residual = pinned
+                stored.copy_(residual, non_blocking=False)
+            state.prev_residual = state.residual
+            state.prev_residual_sigma = state.residual_sigma
+            state.residual = stored
+            state.residual_sigma = sigma
+
+    def _replay(self, state, x, sigma):
+        """Residual for a cached step: plain replay, or a sigma-space linear
+        extrapolation from the last two measured residuals (clamped so a skip
+        run can never extrapolate further than 1.5 measured intervals)."""
+        r1 = state.residual.to(device=x.device, dtype=x.dtype)
+        f = 0.0
+        if (self.forecast and sigma is not None and state.prev_residual is not None
+                and state.residual_sigma is not None and state.prev_residual_sigma is not None):
+            interval = state.residual_sigma - state.prev_residual_sigma
+            if abs(interval) > 1e-8:
+                f = min(max((sigma - state.residual_sigma) / interval, 0.0), self._MAX_EXTRAPOLATE)
+        if f > 0.0:
+            r0 = state.prev_residual.to(device=x.device, dtype=x.dtype)
+            r1 = torch.lerp(r0, r1, 1.0 + f)
+        if self.debug:
+            with comfy.model_prefetch.pause_malloc_graph():
+                state.last_used = r1.detach().clone()
+            logging.info("QwenImage21Speedup: replayed residual, extrapolation factor %.2f", f)
+        return x + r1
 
     def __call__(self, executor, x, timestep, context, ref_latents=None, image_slots=None, transformer_options=None, **kwargs):
         transformer_options = transformer_options or {}
@@ -127,6 +172,7 @@ class _TurboCache:
         state = self.streams.setdefault(
             self._stream_key(x, context, ref_latents, transformer_options), _StreamState())
         step_info = self._step_info(transformer_options)
+        sigma = step_info[0] if step_info is not None else None
 
         with comfy.model_prefetch.pause_malloc_graph():
             indicator = self._indicator(model, timestep, x.dtype)
@@ -158,12 +204,20 @@ class _TurboCache:
                         sigma, percent, diff, state.accumulated, "cached" if eligible else f"full ({reason})")
 
         if eligible:
-            out = x + state.residual.to(device=x.device, dtype=x.dtype)
+            out = self._replay(state, x, sigma)
             state.cache_hits += 1
             state.consecutive_skips += 1
         else:
             out = executor(x, timestep, context, ref_latents, image_slots, transformer_options, **kwargs)
-            self._store_residual(state, out - x)
+            residual = out - x
+            if self.debug and state.last_used is not None:
+                err = float((residual - state.last_used).abs().mean() / out.abs().mean().clamp_min(1e-6))
+                state.pred_err_sum += err
+                state.pred_err_max = max(state.pred_err_max, err)
+                state.pred_err_count += 1
+                logging.info("QwenImage21Speedup: actual forward vs last replayed residual, relative error %.4f", err)
+                state.last_used = None
+            self._store_residual(state, residual, sigma)
             state.full_steps += 1
             state.consecutive_skips = 0
             state.accumulated = 0.0
@@ -203,15 +257,20 @@ class QwenImage21Speedup(io.ComfyNode):
                 io.Boolean.Input("enable_cache", default=True,
                                  tooltip="Skip whole model forwards by replaying the cached residual while the "
                                          "accumulated timestep-embedding drift stays under the threshold."),
-                io.Float.Input("cache_threshold", default=0.10, min=0.0, max=1.0, step=0.01,
+                io.Float.Input("cache_threshold", default=0.40, min=0.0, max=2.0, step=0.01,
                                tooltip="Accumulated relative drift allowed before forcing a full forward. "
-                                       "Higher skips more steps and drifts further from the uncached result."),
+                                       "Measured drift on this model is ~0.13 per step, so the threshold is "
+                                       "roughly 0.13 x the skip run length: 0.3 skips ~2 steps, 0.5 ~3-4, 0.8 ~6."),
                 io.Float.Input("cache_start_percent", default=0.10, min=0.0, max=1.0, step=0.01,
                                tooltip="Caching only kicks in after this point in the sampling schedule."),
                 io.Float.Input("cache_end_percent", default=0.90, min=0.0, max=1.0, step=0.01,
                                tooltip="Caching stops after this point; the tail always runs full forwards."),
                 io.Int.Input("max_consecutive_skips", default=3, min=1, max=10, step=1,
                              tooltip="Upper bound on cached forwards in a row before a full refresh."),
+                io.Boolean.Input("enable_forecast", default=True,
+                                 tooltip="Extrapolate the replayed residual linearly in sigma space from the last "
+                                         "two measured residuals instead of replaying the latest one verbatim. "
+                                         "Tracks the trajectory better mid-schedule; clamped to 1.5 intervals."),
                 io.Combo.Input("cache_device", options=["auto", "gpu", "cpu"], default="auto",
                                tooltip="Where the cached residual lives. auto uses spare VRAM, else pinned RAM."),
                 io.Boolean.Input("enable_sparse_attention", default=False,
@@ -232,8 +291,8 @@ class QwenImage21Speedup(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, enable_cache, cache_threshold, cache_start_percent, cache_end_percent,
-                max_consecutive_skips, cache_device, enable_sparse_attention, sparse_tau, sparse_min_tokens,
-                debug_log=False):
+                max_consecutive_skips, enable_forecast, cache_device, enable_sparse_attention, sparse_tau,
+                sparse_min_tokens, debug_log=False):
         diffusion_model = model.get_model_object("diffusion_model")
         if type(diffusion_model).__name__ != _MODEL_NAME:
             raise ValueError(f"QwenImage21Speedup only supports Qwen Image 2.1 ({_MODEL_NAME}), "
@@ -249,7 +308,7 @@ class QwenImage21Speedup(io.ComfyNode):
         if enable_cache:
             m = m.clone()
             cache = _TurboCache(cache_threshold, cache_start_percent, cache_end_percent,
-                                max_consecutive_skips, cache_device, debug=debug_log)
+                                max_consecutive_skips, cache_device, forecast=enable_forecast, debug=debug_log)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY)
             m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, cache)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY)
