@@ -16,7 +16,7 @@ Qwen Image 2.1 的 ComfyUI 采样加速节点：TeaCache 式跳步门控 + Taylo
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <repo-url> qwen_image_2_1_speedup
+git clone https://github.com/frakd/ComfyUI-Qwen-Image-2.1-Speedup.git qwen_image_2_1_speedup
 ```
 
 重启 ComfyUI 后在 `model/patch` 分类下找到 **Qwen Image 2.1 Speedup**。
@@ -63,7 +63,7 @@ Measured at 40 steps: ~50% of transformer forwards are skipped, ~1.7x speedup on
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <repo-url> qwen_image_2_1_speedup
+git clone https://github.com/frakd/ComfyUI-Qwen-Image-2.1-Speedup.git qwen_image_2_1_speedup
 ```
 
 Restart ComfyUI; the node appears as **Qwen Image 2.1 Speedup** under `model/patch`.
