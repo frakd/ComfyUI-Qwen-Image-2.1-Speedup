@@ -27,7 +27,7 @@ git clone https://github.com/frakd/ComfyUI-Qwen-Image-2.1-Speedup.git qwen_image
 |---|---|---|
 | `enable_cache` | true | 总开关；关闭时模型原样透传 |
 | `cache_threshold` | 0.30 | 累积漂移阈值；自适应模式下作为控制器起点。固定模式下约等于 0.13 × 连跳步数（0.3≈跳2步、0.5≈跳3~4步） |
-| `target_error` | 0.05 | 自适应模式：每次跳跃段结束后实测回放误差，按 0.7×~1.3× 乘性反馈调节有效阈值，把误差维持在目标附近；0.06~0.08 更快、保真略降；0 关闭自适应 |
+| `target_error` | 0.05 | 自适应模式：每次跳跃段结束后实测回放误差，按 0.7×-1.3× 乘性反馈调节有效阈值，把误差维持在目标附近；0.06-0.08 更快、保真略降；0 关闭自适应 |
 | `cache_start_percent` / `cache_end_percent` | 0.15 / 0.90 | 只在调度中段启用缓存，首尾保持全量（实测起始段误差最大） |
 | `max_consecutive_skips` | 3 | 连续跳步上限 |
 | `forecast` | first | 残差外推阶数：`first` 一阶（最近 2 个实测残差，实测最优）；`second` 二阶（3 个残差，二次项有界，实测无额外收益，仅供对比）；`off` 原样重放 |
