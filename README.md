@@ -41,13 +41,20 @@ already built into ComfyUI.
 
 ## Tuning
 
-- **Adaptive mode (recommended)**: set `target_error` (e.g. 0.05) and the node
+- **Adaptive mode (recommended)**: set `target_error` (0.05 is strict,
+  0.06-0.08 trades a little fidelity for clearly more speed) and the node
   closes the loop on quality: after every skip run it measures the actual
   error of the replayed residual against a real forward and multiplies the
-  effective threshold by 0.7x-1.3x to hold the error near the target. This
-  adapts to step count, resolution and prompt automatically — fewer steps
-  make each skip costlier, and the controller shortens skip runs to
-  compensate. `cache_threshold` is the starting point in this mode.
+  effective threshold by 0.7x-1.3x to hold the error near the target. If the
+  controller shrinks the threshold below one step's drift so no skip is
+  possible, three starved steps raise it by 1.5x to re-probe. This adapts to
+  step count, resolution and prompt automatically. `cache_threshold` is the
+  starting point in this mode.
+- **Keep `enable_forecast` on.** Measured on 25-step runs: with forecast a
+  single skip costs ~0.045 relative error, without it ~0.07-0.11 — forecast
+  is what makes skipping affordable at low step counts, and in adaptive mode
+  it is the difference between the controller holding at ~44% skipped and
+  starving down to 20%.
 - **Fixed mode** (`target_error = 0`): `cache_threshold` defaults to 0.40,
   calibrated from measured drift on this model (~0.13 per step mid-schedule
   at 40 steps): the threshold is roughly 0.13 x the skip run length, so 0.3

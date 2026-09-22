@@ -33,6 +33,7 @@ class _StreamState:
         self.last_sigma = None
         self.last_used = None
         self.threshold_eff = None
+        self.starve_count = 0
         self.accumulated = 0.0
         self.consecutive_skips = 0
         self.full_steps = 0
@@ -200,10 +201,19 @@ class _TurboCache:
                     reason = f"outside window ({percent:.2f})"
                 elif state.accumulated >= threshold:
                     reason = f"accumulated drift {state.accumulated:.4f} >= threshold {threshold:.3f}"
+                    if self.target_error > 0:
+                        # starvation recovery: without skips there are no error
+                        # measurements, so a shrunk threshold could never climb back
+                        state.starve_count += 1
+                        if state.starve_count >= 3:
+                            state.threshold_eff = min(threshold * 1.5, 2.0)
+                            state.starve_count = 0
+                            reason += f"; no skips for 3 steps, effective threshold raised to {state.threshold_eff:.3f}"
                 elif state.consecutive_skips >= self.max_consecutive_skips:
                     reason = "max consecutive skips reached"
                 else:
                     eligible = True
+                    state.starve_count = 0
                 if self.debug:
                     logging.info(
                         "QwenImage21Speedup: sigma %.4f, percent %.2f, drift %.4f, accumulated %.4f -> %s",
