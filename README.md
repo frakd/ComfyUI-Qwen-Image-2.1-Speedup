@@ -41,6 +41,10 @@ already built into ComfyUI.
 
 - `cache_threshold` 0.10 is a conservative start; raise toward 0.2 for more
   speed, lower for fidelity. The node logs how many forwards were skipped at
-  the end of each run.
+  the end of each run, and when nothing was skipped it also logs the observed
+  mean/max per-step drift so the threshold can be set from real numbers
+  (turn on `debug_log` for the full per-step trace).
 - `sparse_tau` 1.3 keeps ~11% of key blocks; 1.0 is closer to dense, 1.5+ is
-  aggressive.
+  aggressive. Sparse attention only pays off on long sequences (2K+
+  resolutions, long multi-image prefixes); at 1MP it is usually slower than
+  dense, hence the 8192 default for `sparse_min_tokens`.

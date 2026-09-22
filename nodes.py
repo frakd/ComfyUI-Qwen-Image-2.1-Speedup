@@ -32,6 +32,9 @@ class _StreamState:
         self.consecutive_skips = 0
         self.full_steps = 0
         self.cache_hits = 0
+        self.drift_sum = 0.0
+        self.drift_max = 0.0
+        self.drift_count = 0
 
     def clear_tensors(self):
         self.residual = None
@@ -43,12 +46,13 @@ class _TurboCache:
     replays it while the accumulated drift of the timestep embedding stays
     under the threshold."""
 
-    def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device):
+    def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device, debug=False):
         self.threshold = threshold
         self.start_percent = start_percent
         self.end_percent = end_percent
         self.max_consecutive_skips = max_consecutive_skips
         self.cache_device = cache_device
+        self.debug = debug
         self.streams = {}
 
     def reset(self):
@@ -57,10 +61,18 @@ class _TurboCache:
     def finish(self):
         full = sum(s.full_steps for s in self.streams.values())
         hits = sum(s.cache_hits for s in self.streams.values())
+        drift_count = sum(s.drift_count for s in self.streams.values())
         if full + hits > 0:
             logging.info(
                 "QwenImage21Speedup: %d cached of %d model forwards (%.1f%% skipped)",
                 hits, full + hits, hits / (full + hits) * 100)
+        if drift_count > 0 and (self.debug or hits == 0):
+            drift_sum = sum(s.drift_sum for s in self.streams.values())
+            drift_max = max(s.drift_max for s in self.streams.values())
+            logging.info(
+                "QwenImage21Speedup: per-step indicator drift mean %.4f, max %.4f over %d steps "
+                "(a useful cache_threshold must exceed the mean; current %.3f)",
+                drift_sum / drift_count, drift_max, drift_count, self.threshold)
         for s in self.streams.values():
             s.clear_tensors()
         self.streams = {}
@@ -120,15 +132,30 @@ class _TurboCache:
             indicator = self._indicator(model, timestep, x.dtype)
 
         eligible = False
+        reason = "no cached residual yet"
         if step_info is not None and state.residual is not None and state.prev_indicator is not None:
             sigma, percent = step_info
-            if state.last_sigma is None or sigma <= state.last_sigma + 1e-6:
+            if state.last_sigma is not None and sigma > state.last_sigma + 1e-6:
+                reason = "sigma moved backwards (new run), forcing full"
+            else:
                 diff = float((indicator - state.prev_indicator).abs().mean()
                              / state.prev_indicator.abs().mean().clamp_min(1e-6))
                 state.accumulated += diff
-                eligible = (self.start_percent <= percent <= self.end_percent
-                            and state.accumulated < self.threshold
-                            and state.consecutive_skips < self.max_consecutive_skips)
+                state.drift_sum += diff
+                state.drift_max = max(state.drift_max, diff)
+                state.drift_count += 1
+                if not (self.start_percent <= percent <= self.end_percent):
+                    reason = f"outside window ({percent:.2f})"
+                elif state.accumulated >= self.threshold:
+                    reason = f"accumulated drift {state.accumulated:.4f} >= threshold"
+                elif state.consecutive_skips >= self.max_consecutive_skips:
+                    reason = "max consecutive skips reached"
+                else:
+                    eligible = True
+                if self.debug:
+                    logging.info(
+                        "QwenImage21Speedup: sigma %.4f, percent %.2f, drift %.4f, accumulated %.4f -> %s",
+                        sigma, percent, diff, state.accumulated, "cached" if eligible else f"full ({reason})")
 
         if eligible:
             out = x + state.residual.to(device=x.device, dtype=x.dtype)
@@ -193,16 +220,20 @@ class QwenImage21Speedup(io.ComfyNode):
                 io.Float.Input("sparse_tau", default=1.3, min=0.0, max=4.0, step=0.05,
                                tooltip="Sparsity threshold in score-distribution sigmas. Higher is sparser: "
                                        "1.0 keeps ~16% of key blocks, 1.5 ~7%, 2.0 ~2.7%."),
-                io.Int.Input("sparse_min_tokens", default=2048, min=0, max=1 << 20, step=512,
-                             tooltip="Attention calls with fewer query tokens stay dense. 2048 engages sparse "
-                                     "attention from roughly 1MP images up."),
+                io.Int.Input("sparse_min_tokens", default=8192, min=0, max=1 << 20, step=512,
+                             tooltip="Attention calls with fewer query tokens stay dense. Sparse attention only "
+                                     "pays off on long sequences: roughly 2K+ resolutions or long multi-image "
+                                     "prefixes. At 1MP (4096 tokens) it is usually slower than dense."),
+                io.Boolean.Input("debug_log", default=False,
+                                 tooltip="Log per-step sigma, drift and cache decisions to the console."),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
     def execute(cls, model, enable_cache, cache_threshold, cache_start_percent, cache_end_percent,
-                max_consecutive_skips, cache_device, enable_sparse_attention, sparse_tau, sparse_min_tokens):
+                max_consecutive_skips, cache_device, enable_sparse_attention, sparse_tau, sparse_min_tokens,
+                debug_log=False):
         diffusion_model = model.get_model_object("diffusion_model")
         if type(diffusion_model).__name__ != _MODEL_NAME:
             raise ValueError(f"QwenImage21Speedup only supports Qwen Image 2.1 ({_MODEL_NAME}), "
@@ -218,7 +249,7 @@ class QwenImage21Speedup(io.ComfyNode):
         if enable_cache:
             m = m.clone()
             cache = _TurboCache(cache_threshold, cache_start_percent, cache_end_percent,
-                                max_consecutive_skips, cache_device)
+                                max_consecutive_skips, cache_device, debug=debug_log)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY)
             m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, cache)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY)
