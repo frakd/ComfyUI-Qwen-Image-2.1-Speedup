@@ -32,6 +32,7 @@ class _StreamState:
         self.prev_indicator = None
         self.last_sigma = None
         self.last_used = None
+        self.threshold_eff = None
         self.accumulated = 0.0
         self.consecutive_skips = 0
         self.full_steps = 0
@@ -60,13 +61,14 @@ class _TurboCache:
     _MAX_EXTRAPOLATE = 1.5
 
     def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device,
-                 forecast=True, debug=False):
+                 forecast=True, target_error=0.0, debug=False):
         self.threshold = threshold
         self.start_percent = start_percent
         self.end_percent = end_percent
         self.max_consecutive_skips = max_consecutive_skips
         self.cache_device = cache_device
         self.forecast = forecast
+        self.target_error = target_error
         self.debug = debug
         self.streams = {}
 
@@ -89,12 +91,14 @@ class _TurboCache:
                 "(a useful cache_threshold must exceed the mean; current %.3f)",
                 drift_sum / drift_count, drift_max, drift_count, self.threshold)
         pred_err_count = sum(s.pred_err_count for s in self.streams.values())
-        if pred_err_count > 0 and self.debug:
+        if pred_err_count > 0 and (self.debug or self.target_error > 0):
             err_sum = sum(s.pred_err_sum for s in self.streams.values())
             err_max = max(s.pred_err_max for s in self.streams.values())
+            eff = [s.threshold_eff for s in self.streams.values() if s.threshold_eff is not None]
             logging.info(
-                "QwenImage21Speedup: replayed-residual error vs actual forward mean %.4f, max %.4f over %d checks",
-                err_sum / pred_err_count, err_max, pred_err_count)
+                "QwenImage21Speedup: replayed-residual error vs actual forward mean %.4f, max %.4f over %d checks%s",
+                err_sum / pred_err_count, err_max, pred_err_count,
+                f", final effective threshold {sum(eff) / len(eff):.3f}" if eff else "")
         for s in self.streams.values():
             s.clear_tensors()
         self.streams = {}
@@ -160,9 +164,10 @@ class _TurboCache:
         if f > 0.0:
             r0 = state.prev_residual.to(device=x.device, dtype=x.dtype)
             r1 = torch.lerp(r0, r1, 1.0 + f)
-        if self.debug:
+        if self.debug or self.target_error > 0:
             with comfy.model_prefetch.pause_malloc_graph():
                 state.last_used = r1.detach().clone()
+        if self.debug:
             logging.info("QwenImage21Speedup: replayed residual, extrapolation factor %.2f", f)
         return x + r1
 
@@ -184,6 +189,7 @@ class _TurboCache:
             if state.last_sigma is not None and sigma > state.last_sigma + 1e-6:
                 reason = "sigma moved backwards (new run), forcing full"
             else:
+                threshold = state.threshold_eff if state.threshold_eff is not None else self.threshold
                 diff = float((indicator - state.prev_indicator).abs().mean()
                              / state.prev_indicator.abs().mean().clamp_min(1e-6))
                 state.accumulated += diff
@@ -192,8 +198,8 @@ class _TurboCache:
                 state.drift_count += 1
                 if not (self.start_percent <= percent <= self.end_percent):
                     reason = f"outside window ({percent:.2f})"
-                elif state.accumulated >= self.threshold:
-                    reason = f"accumulated drift {state.accumulated:.4f} >= threshold"
+                elif state.accumulated >= threshold:
+                    reason = f"accumulated drift {state.accumulated:.4f} >= threshold {threshold:.3f}"
                 elif state.consecutive_skips >= self.max_consecutive_skips:
                     reason = "max consecutive skips reached"
                 else:
@@ -210,13 +216,22 @@ class _TurboCache:
         else:
             out = executor(x, timestep, context, ref_latents, image_slots, transformer_options, **kwargs)
             residual = out - x
-            if self.debug and state.last_used is not None:
+            if state.last_used is not None:
+                # measured error of the last replay, the feedback signal for adaptive mode
                 err = float((residual - state.last_used).abs().mean() / out.abs().mean().clamp_min(1e-6))
                 state.pred_err_sum += err
                 state.pred_err_max = max(state.pred_err_max, err)
                 state.pred_err_count += 1
-                logging.info("QwenImage21Speedup: actual forward vs last replayed residual, relative error %.4f", err)
                 state.last_used = None
+                if self.target_error > 0:
+                    base = state.threshold_eff if state.threshold_eff is not None else self.threshold
+                    ratio = min(max(self.target_error / max(err, 1e-4), 0.7), 1.3)
+                    state.threshold_eff = min(max(base * ratio, 0.05), 2.0)
+                if self.debug:
+                    logging.info(
+                        "QwenImage21Speedup: actual forward vs last replayed residual, relative error %.4f%s",
+                        err, f", effective threshold -> {state.threshold_eff:.3f}"
+                        if state.threshold_eff is not None else "")
             self._store_residual(state, residual, sigma)
             state.full_steps += 1
             state.consecutive_skips = 0
@@ -261,8 +276,14 @@ class QwenImage21Speedup(io.ComfyNode):
                                tooltip="Accumulated relative drift allowed before forcing a full forward. "
                                        "Measured drift on this model is ~0.13 per step, so the threshold is "
                                        "roughly 0.13 x the skip run length: 0.3 skips ~2 steps, 0.5 ~3-4, 0.8 ~6."),
-                io.Float.Input("cache_start_percent", default=0.10, min=0.0, max=1.0, step=0.01,
-                               tooltip="Caching only kicks in after this point in the sampling schedule."),
+                io.Float.Input("target_error", default=0.0, min=0.0, max=1.0, step=0.005,
+                               tooltip="Adaptive mode: if > 0 (e.g. 0.05), the effective threshold is adjusted "
+                                       "after every measured replay error to hold the error near this target "
+                                       "(multiplicative feedback, 0.7x-1.3x per correction). Adapts to step "
+                                       "count, resolution and prompt automatically. 0 uses the fixed threshold."),
+                io.Float.Input("cache_start_percent", default=0.15, min=0.0, max=1.0, step=0.01,
+                               tooltip="Caching only kicks in after this point in the sampling schedule. "
+                                       "Measured replay error is highest right after the start, keep >= 0.15."),
                 io.Float.Input("cache_end_percent", default=0.90, min=0.0, max=1.0, step=0.01,
                                tooltip="Caching stops after this point; the tail always runs full forwards."),
                 io.Int.Input("max_consecutive_skips", default=3, min=1, max=10, step=1,
@@ -290,7 +311,7 @@ class QwenImage21Speedup(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, enable_cache, cache_threshold, cache_start_percent, cache_end_percent,
+    def execute(cls, model, enable_cache, cache_threshold, target_error, cache_start_percent, cache_end_percent,
                 max_consecutive_skips, enable_forecast, cache_device, enable_sparse_attention, sparse_tau,
                 sparse_min_tokens, debug_log=False):
         diffusion_model = model.get_model_object("diffusion_model")
@@ -308,7 +329,8 @@ class QwenImage21Speedup(io.ComfyNode):
         if enable_cache:
             m = m.clone()
             cache = _TurboCache(cache_threshold, cache_start_percent, cache_end_percent,
-                                max_consecutive_skips, cache_device, forecast=enable_forecast, debug=debug_log)
+                                max_consecutive_skips, cache_device, forecast=enable_forecast,
+                                target_error=target_error, debug=debug_log)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY)
             m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, cache)
             m.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY)

@@ -41,13 +41,22 @@ already built into ComfyUI.
 
 ## Tuning
 
-- `cache_threshold` defaults to 0.40, calibrated from measured drift on this
-  model (~0.13 per step mid-schedule): the threshold is roughly 0.13 x the
-  skip run length, so 0.3 skips ~2 steps per refresh, 0.5 ~3-4, 0.8 ~6. The
-  node logs how many forwards were skipped at the end of each run; with
-  `debug_log` on it also reports the measured error of replayed residuals vs
-  actual full forwards (mean/max), which is the quantity to watch while
-  raising the threshold.
+- **Adaptive mode (recommended)**: set `target_error` (e.g. 0.05) and the node
+  closes the loop on quality: after every skip run it measures the actual
+  error of the replayed residual against a real forward and multiplies the
+  effective threshold by 0.7x-1.3x to hold the error near the target. This
+  adapts to step count, resolution and prompt automatically — fewer steps
+  make each skip costlier, and the controller shortens skip runs to
+  compensate. `cache_threshold` is the starting point in this mode.
+- **Fixed mode** (`target_error = 0`): `cache_threshold` defaults to 0.40,
+  calibrated from measured drift on this model (~0.13 per step mid-schedule
+  at 40 steps): the threshold is roughly 0.13 x the skip run length, so 0.3
+  skips ~2 steps per refresh, 0.5 ~3-4, 0.8 ~6.
+- Keep `cache_start_percent` >= 0.15: measured replay error peaks right at
+  the schedule start.
+- The node logs the skip rate at the end of each run; with `debug_log` (or
+  adaptive mode) it also reports the measured replay error mean/max and the
+  final effective threshold.
 - `sparse_tau` 1.3 keeps ~11% of key blocks; 1.0 is closer to dense, 1.5+ is
   aggressive. Sparse attention only pays off on long sequences (2K+
   resolutions, long multi-image prefixes); at 1MP it is usually slower than
